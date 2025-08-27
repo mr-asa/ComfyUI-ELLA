@@ -3,6 +3,8 @@ from collections import OrderedDict
 from typing import Optional
 
 import torch
+import os
+from safetensors.torch import load_file
 from comfy import model_management
 from comfy.model_patcher import ModelPatcher
 from safetensors.torch import load_model
@@ -10,6 +12,59 @@ from torch import nn
 
 from .activations import get_activation
 from .utils import patch_device_empty_setter, remove_weights
+
+
+ELLA_DEBUG = os.getenv("ELLA_DEBUG", "0") in ("1", "true", "True")
+
+def _count_params(m: torch.nn.Module):
+    total = sum(p.numel() for p in m.parameters())
+    trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
+    return total, trainable
+
+def _size_mb(m: torch.nn.Module):
+    # estimate the size of parameters in MB
+    bytes_total = sum(p.numel() * p.element_size() for p in m.parameters())
+    return bytes_total / (1024 ** 2)
+
+
+
+def load_model_lenient(model: torch.nn.Module, path: str):
+    sd_file = load_file(path)  # dict[name -> Tensor]
+    model_sd = model.state_dict()
+
+    new_sd = {}
+    skipped_shape = []
+    extra = []
+    casted = []
+
+    for k, v in sd_file.items():
+        if k in model_sd:
+            if model_sd[k].shape == v.shape:
+                if model_sd[k].dtype != v.dtype:
+                    v = v.to(model_sd[k].dtype)
+                    casted.append(k)
+                # transfer to the parameter device
+                if v.device != model_sd[k].device:
+                    v = v.to(model_sd[k].device)
+                new_sd[k] = v
+            else:
+                skipped_shape.append((k, tuple(v.shape), tuple(model_sd[k].shape)))
+        else:
+            extra.append(k)
+
+    if skipped_shape:
+        print(f"[ELLA/load] skipped by shape: {len(skipped_shape)} (e.g. {skipped_shape[:3]})")
+    if extra:
+        print(f"[ELLA/load] extra keys in ckpt: {len(extra)} (e.g. {extra[:5]})")
+    if casted:
+        print(f"[ELLA/load] dtype casted: {len(casted)} (e.g. {casted[:5]})")
+
+    missing = [k for k in model_sd.keys() if k not in new_sd]
+    if missing:
+        print(f"[ELLA/load] missing in ckpt: {len(missing)} (e.g. {missing[:5]})")
+
+    model.load_state_dict(new_sd, strict=False)
+    return model
 
 
 class AdaLayerNorm(nn.Module):
@@ -327,8 +382,8 @@ class ELLA:
         self.dtype = model_management.text_encoder_dtype(self.load_device)
         self.output_device = model_management.intermediate_device()
         self.model = ELLAModel()
-        load_model(self.model, path, strict=True)
-        self.model.to(self.dtype)  # type: ignore
+        load_model_lenient(self.model, path)
+        self.model.to(dtype=torch.float16)
         self.patcher = ModelPatcher(self.model, load_device=self.load_device, offload_device=self.offload_device)
 
     def load_model(self):

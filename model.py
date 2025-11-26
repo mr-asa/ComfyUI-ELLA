@@ -377,22 +377,34 @@ class ELLAModel(nn.Module):
 
 class ELLA:
     def __init__(self, path: str, **kwargs) -> None:
-        self.load_device = model_management.text_encoder_device()
-        self.offload_device = model_management.text_encoder_offload_device()
-        self.dtype = model_management.text_encoder_dtype(self.load_device)
+        # Берём те же девайсы/тип, что и для текстовых энкодеров
+        self.device = model_management.text_encoder_device()
+        self.dtype = model_management.text_encoder_dtype(self.device)
         self.output_device = model_management.intermediate_device()
+
+        # Создаём модель и грузим веса
         self.model = ELLAModel()
         load_model_lenient(self.model, path)
-        self.model.to(dtype=torch.float16)
-        self.patcher = ModelPatcher(self.model, load_device=self.load_device, offload_device=self.offload_device)
+
+        # Гоним ВСЮ модель на один девайс и один dtype
+        self.model.to(device=self.device, dtype=self.dtype)
+        self.model.eval()
 
     def load_model(self):
-        model_management.load_model_gpu(self.patcher)
-        return self.patcher
+        # На всякий случай убеждаемся, что модель на нужном девайсе/типе
+        self.model.to(device=self.device, dtype=self.dtype)
+        return self.model
 
     def __call__(self, timesteps: torch.Tensor, t5_embeds: torch.Tensor, **kwargs):
+        # Никаких load_model_gpu / ModelPatcher — только прямой PyTorch
         self.load_model()
-        timesteps = timesteps.to(device=self.load_device, dtype=torch.int64)
-        t5_embeds = t5_embeds.to(device=self.load_device, dtype=self.dtype)  # type: ignore
+
+        # Входы -> туда же, где модель
+        timesteps = timesteps.to(device=self.device, dtype=torch.int64)
+        t5_embeds = t5_embeds.to(device=self.device, dtype=self.dtype)  # type: ignore
+
+        # Прямой форвард
         cond = self.model(timesteps, t5_embeds, **kwargs)
+
+        # Результат — на промежуточный девайс (обычно CPU), как у остальных энкодеров
         return cond.to(self.output_device)
